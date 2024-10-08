@@ -9,6 +9,8 @@ for i in range(p.get_device_count()):
     print(f"  Name: {device_info['name']}")
     print(f"  Max Input Channels: {device_info['maxInputChannels']}")
     print(f"  Max Output Channels: {device_info['maxOutputChannels']}")
+    print(f"Supported Sample Rates: {device_info['defaultSampleRate']}")
+
     print()
 
 p.terminate()

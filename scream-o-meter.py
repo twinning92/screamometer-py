@@ -8,305 +8,311 @@ import soundfile as sf
 import threading
 import digitalio
 
-
 # Constants for NeoPixel
 LED_PIN = board.D12
 NUM_LEDS = 144
-BRIGHTNESS = 1  # Scale 0-1
-led_strip = neopixel.NeoPixel(LED_PIN, NUM_LEDS, brightness=BRIGHTNESS, auto_write=False)
+BRIGHTNESS = 1.0  # Scale 0-1
 
 # PyAudio constants
 SAMPLE_RATE = 44100
-CHANNELS = 2
+CHANNELS = 2  # Use mono input to simplify processing
 BUFFER_SIZE = 1024  # Size of buffer for PyAudio
 
-# Initialize variables for tracking high score
-high_score = 0
-session_high_score = 0
-last_high_score_time = 0
-inactivity_period = 10  # Seconds of inactivity to reset session high score and audio reset
-noise_threshold = 2000.0  # Noise floor to filter out background noise
-scaling_factor = 5.0  # Logarithmic scaling factor
-alpha = 0.04  # Smoothing factor
+# Audio processing constants
+NOISE_THRESHOLD = 2000.0  # Noise floor to filter out background noise
+SCALING_FACTOR = 10.0  # Logarithmic scaling factor
+ALPHA = 0.4  # Smoothing factor (increased for better smoothing)
 
+# High score tracking
+INACTIVITY_PERIOD = 10  # Seconds to reset session high score
+HIGH_SCORE_RESET = 60  # Seconds to reset overall high score
 
-# Initialize PyAudio for capturing microphone input
-p = pyaudio.PyAudio()  # Initialize a single PyAudio instance for both input and output
+pyaudio_instance = pyaudio.PyAudio()
 
-# Function to apply logarithmic scaling
-def apply_logarithmic_scaling(input_value, max_value, scaling_factor):
-    input_value = max(input_value, 1.0)  # Avoid log(0)
-    log_value = math.log(input_value) / math.log(scaling_factor)
-    return int(min(max_value, log_value * (max_value / math.log(scaling_factor))))
+class LEDController:
+    def __init__(self):
+        # Initialize your variables
+        self.num_leds = 144  # Example number of LEDs
+        self.led_strip = neopixel.NeoPixel(LED_PIN, NUM_LEDS, auto_write=False)  # Initialize your LED strip object
+        self.color = (255, 131, 0)  # Initial color
+        self.current_pixel = 0  # Start at pixel 0
+        self.previous_pixel = 0  # Keep track of the previous pixel
+        self.active_pixels = {}  # Dictionary to hold active pixels with brightness and color
+        self.max_brightness = 255  # Maximum brightness
+        self.fade_step = 10  # Amount by which brightness decreases each update
+        self.movement_speed = 3  # Number of pixels to move each update
+        self.trail_direction = 1  # Initial direction
+        self.smoothed_display_value = 0
+        self.alpha = 0.1  # Smoothing factor
+        self.current_zone = 'orange'
+        # Define color zones with hysteresis thresholds
+        self.color_zones = [
+            {
+                'name': 'green',
+                'color': (0, 255, 0),
+                'upper_threshold': self.num_leds * 0.95,
+                'lower_threshold': self.num_leds * 0.95
+            },
+            {
+                'name': 'red',
+                'color': (255, 0, 0),
+                'upper_threshold': self.num_leds * 0.80,
+                'lower_threshold': self.num_leds * 0.80
+            },
+            {
+                'name': 'magenta',
+                'color': (255, 0, 255),
+                'upper_threshold': self.num_leds * 0.50,
+                'lower_threshold': self.num_leds * 0.50
+            },
+            {
+                'name': 'orange',
+                'color': (255, 131, 0),
+                'upper_threshold': 0,
+                'lower_threshold': 0
+            }
+        ]
 
-# Function to update the LED strip
-def update_leds(display_value, high_score, session_high_score):
-    # Clear the LED strip
-    display_value = 143
-    led_strip.fill((0, 0, 0))
-    if display_value >= NUM_LEDS - 1:
-        victory_animation()
-        time.sleep(3)
-        return
-    # Determine the color based on the current display value
-    if display_value >= NUM_LEDS * 0.95:
-        led_colour = (0, 255, 0)  # white for very high values
-    elif display_value >= NUM_LEDS * 0.8:
-        led_colour = (255, 0, 0)      # red for high values
-    elif display_value >= NUM_LEDS * 0.6:
-        led_colour = (255, 0, 255)    # magenta for middle values
-    else:
-        led_colour = (255, 131, 0)    # orange for low values
-
-    # Update LEDs according to the current amplitude value
-    for i in range(min(display_value, NUM_LEDS)):
-        led_strip[i] = led_colour
-
-    # Ensure high score does not exceed the LED count minus space for indication
-    clamped_high_score = min(high_score, NUM_LEDS - 3)
-    clamped_session_high_score = min(session_high_score, NUM_LEDS - 1)
-
-    # Highlight the session high score if within bounds
-    if clamped_session_high_score < NUM_LEDS:
-        led_strip[clamped_session_high_score] = (0, 255, 0)  # Green for session high score
-
-    # Highlight the overall high score with a more prominent marker
-    if clamped_high_score < NUM_LEDS - 2:  # Ensure there's room for the red markers
-        led_strip[clamped_high_score] =     (255, 0, 0)  # Red for high score
-        led_strip[clamped_high_score + 1] = (255, 0, 0)  # Continue the red marker
-        led_strip[clamped_high_score + 2] = (255, 0, 0)  # Ensure it's distinctly visible
+    def update_leds(self, display_value, high_score, session_high_score):
+        # Update the color based on the current display value
+        new_zone = self.current_zone  # Default to the current zone
+        for zone in self.color_zones:
+            if self.current_zone == zone['name']:
+                # Check if we need to switch to a lower zone
+                if self.current_pixel < zone['lower_threshold']:
+                    continue  # Continue checking lower zones
+                else:
+                    new_zone = zone['name']
+                    break  # Stay in the current zone
+            else:
+                # Check if we need to switch to a higher zone
+                if self.current_pixel >= zone['upper_threshold']:
+                    new_zone = zone['name']
+                    break
+        if new_zone != self.current_zone:
+            self.current_zone = new_zone
+            self.color = next(zone['color'] for zone in self.color_zones if zone['name'] == new_zone)
         
+        target_pixel = int(display_value)
 
-    
-    led_strip.show()
-    
-    
-def victory_animation():
-    # blink_display()
-    sweep_with_reverse_and_fade()
-    
-def blink_display():
-    led_strip.fill((255,0,0))
-    print("victory!")
-    for _ in range(3):
-        led_strip.fill((255,0,0))  # Turn all LEDs to the specified color
-        led_strip.show()
-        time.sleep(0.2)
-        led_strip.fill((0, 0, 0))  # Turn off all LEDs
-        led_strip.show()
-        time.sleep(0.2)
+        # Determine direction to move
+        if target_pixel > self.current_pixel:
+            self.trail_direction = 1
+        elif target_pixel < self.current_pixel:
+            self.trail_direction = -1
+        else:
+            self.trail_direction = 0
+
+        # Keep track of the previous position
+        self.previous_pixel = self.current_pixel
+
+        # Move current_pixel towards target_pixel
+        if self.trail_direction != 0:
+            self.current_pixel += self.trail_direction * self.movement_speed
+            # Ensure current_pixel is within bounds
+            self.current_pixel = max(0, min(self.current_pixel, self.num_leds - 1))
+            # Determine the range of pixels to light up
+            if self.trail_direction > 0:
+                pixel_range = range(self.previous_pixel + 1, self.current_pixel + 1)
+            else:
+                pixel_range = range(self.previous_pixel - 1, self.current_pixel - 1, -1)
+            # Add intermediate pixels to active_pixels
+            for pixel in pixel_range:
+                self.active_pixels[pixel] = {'brightness':self.max_brightness, 'color':self.color}
+        else:
+            # If there's no movement, ensure the current pixel is added
+            self.active_pixels[self.current_pixel] = self.max_brightness
+
+        # Ensure current_pixel is within bounds
+        self.current_pixel = max(0, min(self.current_pixel, self.num_leds - 1))
+
+        # Add current_pixel to active_pixels with max brightness
+        self.active_pixels[self.current_pixel] = {'brightness':self.max_brightness, 'color':self.color}
+
+        # Clear all LEDs
+        self.led_strip.fill((0, 0, 0))
+
+        # Update and display active pixels
+        pixels_to_remove = []
+        for pixel in list(self.active_pixels.keys()):
+            pixel_info = self.active_pixels[pixel]
+            brightness = pixel_info['brightness']
+            color = pixel_info['color']
+            # Compute color based on brightness
+            r, g, b = color
+            factor = brightness / self.max_brightness
+            self.led_strip[pixel] = (
+                int(r * factor),
+                int(g * factor),
+                int(b * factor),
+            )
+            # Decrease brightness
+            brightness -= self.fade_step
+            if brightness <= 0:
+                pixels_to_remove.append(pixel)
+            else:
+                self.active_pixels[pixel]['brightness'] = brightness  # Update brightness
+
+        # Remove pixels that have faded out
+        for pixel in pixels_to_remove:
+            del self.active_pixels[pixel]
+
+        # Display the updated strip
+        self.led_strip.show()
+
+        # Optional: Add a small delay to control the speed
+        time.sleep(0.001)
+
+    def clear(self):
+        self.led_strip.fill((0, 0, 0))
+        self.led_strip.show()
         
-def sweep_with_reverse_and_fade(color=(255, 0, 0), num_sweeps=3, target_fps=300):
-    steps = 35  # Number of steps for the fade-out effect
-    frame_duration = 1.0 / target_fps  # Duration of each frame in seconds
+    def __exit__(self):
+        self.clear()
 
-    for _ in range(num_sweeps):
-        fading_leds = {}  # Dictionary to track fading LEDs: {LED index: remaining fade steps}
-        total_frames = NUM_LEDS + steps  # Total frames for each sweep
+class AudioProcessor:
+    def __init__(self):
+        self.stream_in = pyaudio_instance.open(
+            format=pyaudio.paInt16,
+            channels=CHANNELS,
+            rate=SAMPLE_RATE,
+            input=True,
+            input_device_index=1,
+            frames_per_buffer=BUFFER_SIZE,
+        )
+        self.smoothed_value = 0.3
+        self.high_score = 0
+        self.session_high_score = 0
+        self.last_high_score_time = time.time()
 
-        # Sweep from bottom to top
-        for frame in range(total_frames):
-            start_time = time.time()
+    def apply_logarithmic_scaling(self, input_value, max_value, scaling_factor):
+        # Ensure input_value is at least 1 to avoid math domain error
+        input_value = max(input_value, 1.0)
+        # Calculate the logarithm of the input value
+        log_value = math.log(input_value) / math.log(scaling_factor)
+        # Scale the logarithmic value to the max_value range
+        scaled_value = (log_value / (math.log(32767) / math.log(scaling_factor))) * max_value
+        return min(max_value, scaled_value)
 
-            # Activate the next LED in the sweep
-            if frame < NUM_LEDS:
-                led_index = frame
-                led_strip[led_index] = color
-
-                # Start fading the previous LED
-                if led_index > 0:
-                    fading_leds[led_index - 1] = steps
-            else:
-                # After the last LED, ensure the final LED starts fading
-                if (NUM_LEDS - 1) not in fading_leds:
-                    fading_leds[NUM_LEDS - 1] = steps
-
-            # Update fading LEDs
-            for led in list(fading_leds.keys()):
-                fade_step = fading_leds[led]
-                fade_factor = fade_step / float(steps)
-                r, g, b = color
-                led_strip[led] = (
-                    int(r * fade_factor),
-                    int(g * fade_factor),
-                    int(b * fade_factor)
-                )
-                fading_leds[led] -= 1
-                if fading_leds[led] <= 0:
-                    led_strip[led] = (0, 0, 0)  # Turn off the LED completely
-                    del fading_leds[led]
-
-            # Display the updated strip
-            led_strip.show()
-
-            # Calculate elapsed time and sleep to maintain frame rate
-            elapsed = time.time() - start_time
-            time_to_sleep = frame_duration - elapsed
-            if time_to_sleep > 0:
-                time.sleep(time_to_sleep)
-            else:
-                # If processing took longer than frame duration, skip sleep
-                pass
-
-        # Sweep from top to bottom
-        fading_leds = {}  # Reset fading LEDs for the reverse sweep
-        for frame in range(total_frames):
-            start_time = time.time()
-
-            # Activate the next LED in the reverse sweep
-            if frame < NUM_LEDS:
-                led_index = NUM_LEDS - 1 - frame
-                led_strip[led_index] = color
-
-                # Start fading the next LED
-                if led_index < NUM_LEDS - 1:
-                    fading_leds[led_index + 1] = steps
-            else:
-                # After the first LED, ensure the first LED starts fading
-                if 0 not in fading_leds:
-                    fading_leds[0] = steps
-
-            # Update fading LEDs
-            for led in list(fading_leds.keys()):
-                fade_step = fading_leds[led]
-                fade_factor = fade_step / float(steps)
-                r, g, b = color
-                led_strip[led] = (
-                    int(r * fade_factor),
-                    int(g * fade_factor),
-                    int(b * fade_factor)
-                )
-                fading_leds[led] -= 1
-                if fading_leds[led] <= 0:
-                    led_strip[led] = (0, 0, 0)  # Turn off the LED completely
-                    del fading_leds[led]
-
-            # Display the updated strip
-            led_strip.show()
-
-            # Calculate elapsed time and sleep to maintain frame rate
-            elapsed = time.time() - start_time
-            time_to_sleep = frame_duration - elapsed
-            if time_to_sleep > 0:
-                time.sleep(time_to_sleep)
-            else:
-                # If processing took longer than frame duration, skip sleep
-                pass
-
-    # Turn off the strip after completion
-    led_strip.fill((0, 0, 0))
-    led_strip.show()
-
-
-def motion_sense():
-    pir = digitalio.DigitalInOut(board.D13)
-    pir.direction = digitalio.Direction.INPUT
-    
-    while True:
-        if pir.value:
-            play_audio()
-            print("Motion Detected")
-            time.sleep(5)
-
-def play_audio():
-    file = "../test_recording.wav"
-    audio_data, sample_rate = sf.read(file, dtype='float32')
-    current_frame = 0
-
-    def callback(out_data, frame_count, time_info, status):
-        nonlocal current_frame
-        end = current_frame + frame_count
-
-        # Check if we're at the end of the audio file
-        if end > len(audio_data):
-            data_chunk = audio_data[current_frame:]  # Get remaining data
-            return (data_chunk.tobytes(), pyaudio.paComplete)  # Signal end of stream
-
-        # If we have enough data, return the chunk
-        data_chunk = audio_data[current_frame:end]
-        current_frame = end
-        return (data_chunk.tobytes(), pyaudio.paContinue)
-
-    stream_out = p.open(format=pyaudio.paFloat32,
-                        channels=audio_data.shape[1] if len(audio_data.shape) > 1 else 1,
-                        rate=sample_rate,
-                        output=True,
-                        stream_callback=callback)
-    
-    stream_out.start_stream()
-
-    while stream_out.is_active():
-        time.sleep(0.1)  # Avoid high CPU usage
-
-    stream_out.stop_stream()
-    stream_out.close()
-
-# Function to capture microphone input and process data
-def scream_o_meter():
-    global high_score, session_high_score, last_high_score_time
-
-    stream_in = p.open(format=pyaudio.paInt16,
-                       channels=CHANNELS,
-                       rate=SAMPLE_RATE,
-                       input=True,
-                       input_device_index=1,
-                       frames_per_buffer=BUFFER_SIZE)
-
-    smoothed_value = 0
-
-    while True:
-        data = stream_in.read(BUFFER_SIZE, exception_on_overflow=False)
+    def process_audio(self):
+        data = self.stream_in.read(BUFFER_SIZE, exception_on_overflow=False)
         audio_data = np.frombuffer(data, dtype=np.int16)
 
-        # Calculate mean of absolute values (signal amplitude)
+        # Calculate RMS (Root Mean Square) to get a better measure of loudness
         mean = np.mean(np.abs(audio_data))
 
         # Apply noise threshold
-        if mean < noise_threshold:
-            mean = 0
-        
+        if mean < NOISE_THRESHOLD:
+            mean = 0.0
+
         # Apply logarithmic scaling
-        mapped_value = apply_logarithmic_scaling(mean, NUM_LEDS, scaling_factor)
+        mapped_value = self.apply_logarithmic_scaling(mean, NUM_LEDS, SCALING_FACTOR)
 
         # Exponential smoothing
-        smoothed_value = (alpha * mapped_value) + ((1 - alpha) * smoothed_value)
-        display_value = int(smoothed_value)
+        self.smoothed_value = (ALPHA * mapped_value) + ((1 - ALPHA) * self.smoothed_value)
+        display_value = int(self.smoothed_value)
 
         # Update high scores
-        if display_value > high_score:
-            high_score = display_value
+        current_time = time.time()
+        if display_value > self.high_score:
+            self.high_score = display_value
 
-        if display_value > session_high_score:
-            session_high_score = display_value
-            last_high_score_time = time.time()
-            
+        if display_value > self.session_high_score:
+            self.session_high_score = display_value
+            self.last_high_score_time = current_time
+
         # Reset session high score after inactivity
-        if time.time() - last_high_score_time > inactivity_period:
-            session_high_score = 0
+        if current_time - self.last_high_score_time > INACTIVITY_PERIOD:
+            self.session_high_score = 0
 
-        # Update LEDs
-        update_leds(display_value, high_score, session_high_score)
+        return display_value, self.high_score, self.session_high_score
 
-        time.sleep(0.01)  # Small delay to avoid CPU overload
+    def close(self):
+        self.stream_in.stop_stream()
+        self.stream_in.close()
+        pyaudio_instance.terminate()
 
-# Run the scream-o-meter and audio playback in separate threads
-if __name__ == "__main__":
+class MotionSensor:
+    def __init__(self):
+        self.pir = digitalio.DigitalInOut(board.D13)
+        self.pir.direction = digitalio.Direction.INPUT
+
+    def detect_motion(self):
+        return self.pir.value
+
+class AudioPlayer:
+    def __init__(self, file_path):
+        self.file_path = file_path
+        self.audio_data, self.sample_rate = sf.read(self.file_path, dtype='float32')
+        self.current_frame = 0
+        self.stream_out = None
+
+    def play(self):
+        self.stream_out = pyaudio_instance.open(
+            format=pyaudio.paFloat32,
+            channels=self.audio_data.shape[1] if len(self.audio_data.shape) > 1 else 1,
+            rate=self.sample_rate,
+            output=True,
+            output_device_index=3,
+            stream_callback=self.callback,
+        )
+        self.stream_out.start_stream()
+
+        while self.stream_out.is_active():
+            time.sleep(0.1)
+
+        self.stream_out.stop_stream()
+        self.stream_out.close()
+
+    def callback(self, out_data, frame_count, time_info, status):
+        end = self.current_frame + frame_count
+        data_chunk = self.audio_data[self.current_frame:end]
+        self.current_frame = end
+        if len(data_chunk) < frame_count:
+            return (data_chunk.tobytes(), pyaudio.paComplete)
+        else:
+            return (data_chunk.tobytes(), pyaudio.paContinue)
+
+def scream_o_meter():
+    led_controller = LEDController()
+    audio_processor = AudioProcessor()
+
     try:
-        # Run play_audio and scream_o_meter in parallel using threads
-        motion_thread = threading.Thread(target=motion_sense)
-        scream_thread = threading.Thread(target=scream_o_meter)
+        while True:
+            display_value, high_score, session_high_score = audio_processor.process_audio()
+            led_controller.update_leds(display_value, high_score, session_high_score)
+            time.sleep(0.01)  # Adjust as needed
+    except KeyboardInterrupt:
+        pass
+    finally:
+        led_controller.clear()
+        audio_processor.close()
 
-        motion_thread.start()
-        scream_thread.start()
+def motion_sense():
+    motion_sensor = MotionSensor()
+    while True:
+        if motion_sensor.detect_motion():
+            print("Motion Detected")
+            audio_player = AudioPlayer("../test_recording.wav")
+            audio_player.play()
+            time.sleep(5)  # Debounce time
+        time.sleep(0.1)  # Polling interval
 
-        # Wait for both threads to complete
-        motion_thread.join()
-        scream_thread.join()
+def main():
+    motion_thread = threading.Thread(target=motion_sense, daemon=True)
+    scream_thread = threading.Thread(target=scream_o_meter, daemon=True)
 
+    motion_thread.start()
+    scream_thread.start()
+    
+    try:
+        while True:
+            time.sleep(0.1)
     except KeyboardInterrupt:
         print("Exiting...")
-
     finally:
-        led_strip.fill((0, 0, 0))  # Clear LEDs
-        led_strip.show()
-        p.terminate()  # Terminate PyAudio
+        # Threads will be closed automatically on exit
+        pass
+
+if __name__ == "__main__":
+    main()
