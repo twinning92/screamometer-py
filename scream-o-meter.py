@@ -21,7 +21,7 @@ BUFFER_SIZE = 1024  # Size of buffer for PyAudio
 # Audio processing constants
 NOISE_THRESHOLD = 2000.0  # Noise floor to filter out background noise
 SCALING_FACTOR = 10.0  # Logarithmic scaling factor
-ALPHA = 0.4  # Smoothing factor (increased for better smoothing)
+ALPHA = 0.1  # Smoothing factor (increased for better smoothing)
 
 # High score tracking
 INACTIVITY_PERIOD = 10  # Seconds to reset session high score
@@ -31,70 +31,45 @@ pyaudio_instance = pyaudio.PyAudio()
 
 class LEDController:
     def __init__(self):
-        # Initialize your variables
         self.num_leds = 144  # Example number of LEDs
         self.led_strip = neopixel.NeoPixel(LED_PIN, NUM_LEDS, auto_write=False)  # Initialize your LED strip object
-        self.color = (255, 131, 0)  # Initial color
         self.current_pixel = 0  # Start at pixel 0
         self.previous_pixel = 0  # Keep track of the previous pixel
-        self.active_pixels = {}  # Dictionary to hold active pixels with brightness and color
+        self.active_pixels = {}  # Dictionary to hold active pixels and their brightness
         self.max_brightness = 255  # Maximum brightness
-        self.fade_step = 10  # Amount by which brightness decreases each update
-        self.movement_speed = 3  # Number of pixels to move each update
+        self.fade_step = 20  # Amount by which brightness decreases each update
+        self.movement_speed = 2  # Number of pixels to move each update
         self.trail_direction = 1  # Initial direction
-        self.smoothed_display_value = 0
-        self.alpha = 0.1  # Smoothing factor
-        self.current_zone = 'orange'
-        # Define color zones with hysteresis thresholds
-        self.color_zones = [
-            {
-                'name': 'green',
-                'color': (0, 255, 0),
-                'upper_threshold': self.num_leds * 0.95,
-                'lower_threshold': self.num_leds * 0.95
-            },
+        self.position_zones = [
             {
                 'name': 'red',
                 'color': (255, 0, 0),
-                'upper_threshold': self.num_leds * 0.80,
-                'lower_threshold': self.num_leds * 0.80
+                'start_pixel': int(self.num_leds * 0.95),
+                'end_pixel': self.num_leds - 1
+            },
+            {
+                'name': 'pink',
+                'color': (255, 25, 20),
+                'start_pixel': int(self.num_leds * 0.8),
+                'end_pixel': int(self.num_leds * 0.95) - 1
             },
             {
                 'name': 'magenta',
-                'color': (255, 0, 255),
-                'upper_threshold': self.num_leds * 0.50,
-                'lower_threshold': self.num_leds * 0.50
+                'color': (100, 0, 255),
+                'start_pixel': int(self.num_leds * 0.5),
+                'end_pixel': int(self.num_leds * 0.8) - 1
             },
             {
                 'name': 'orange',
-                'color': (255, 131, 0),
-                'upper_threshold': 0,
-                'lower_threshold': 0
+                'color': (255, 25, 0),
+                'start_pixel': 0,
+                'end_pixel': int(self.num_leds * 0.5) - 1
             }
         ]
 
     def update_leds(self, display_value, high_score, session_high_score):
-        # Update the color based on the current display value
-        new_zone = self.current_zone  # Default to the current zone
-        for zone in self.color_zones:
-            if self.current_zone == zone['name']:
-                # Check if we need to switch to a lower zone
-                if self.current_pixel < zone['lower_threshold']:
-                    continue  # Continue checking lower zones
-                else:
-                    new_zone = zone['name']
-                    break  # Stay in the current zone
-            else:
-                # Check if we need to switch to a higher zone
-                if self.current_pixel >= zone['upper_threshold']:
-                    new_zone = zone['name']
-                    break
-        if new_zone != self.current_zone:
-            self.current_zone = new_zone
-            self.color = next(zone['color'] for zone in self.color_zones if zone['name'] == new_zone)
-        
         target_pixel = int(display_value)
-
+        
         # Determine direction to move
         if target_pixel > self.current_pixel:
             self.trail_direction = 1
@@ -102,10 +77,10 @@ class LEDController:
             self.trail_direction = -1
         else:
             self.trail_direction = 0
-
+        
         # Keep track of the previous position
         self.previous_pixel = self.current_pixel
-
+        
         # Move current_pixel towards target_pixel
         if self.trail_direction != 0:
             self.current_pixel += self.trail_direction * self.movement_speed
@@ -118,20 +93,16 @@ class LEDController:
                 pixel_range = range(self.previous_pixel - 1, self.current_pixel - 1, -1)
             # Add intermediate pixels to active_pixels
             for pixel in pixel_range:
-                self.active_pixels[pixel] = {'brightness':self.max_brightness, 'color':self.color}
+                pixel_color = self.get_color_for_pixel(pixel)  # Get color based on pixel position
+                self.active_pixels[pixel] = {'brightness': self.max_brightness, 'color': pixel_color}
         else:
             # If there's no movement, ensure the current pixel is added
-            self.active_pixels[self.current_pixel] = self.max_brightness
-
-        # Ensure current_pixel is within bounds
-        self.current_pixel = max(0, min(self.current_pixel, self.num_leds - 1))
-
-        # Add current_pixel to active_pixels with max brightness
-        self.active_pixels[self.current_pixel] = {'brightness':self.max_brightness, 'color':self.color}
-
+            pixel_color = self.get_color_for_pixel(self.current_pixel)  # Get color based on pixel position
+            self.active_pixels[self.current_pixel] = {'brightness': self.max_brightness, 'color': pixel_color}
+        
         # Clear all LEDs
         self.led_strip.fill((0, 0, 0))
-
+        
         # Update and display active pixels
         pixels_to_remove = []
         for pixel in list(self.active_pixels.keys()):
@@ -152,17 +123,24 @@ class LEDController:
                 pixels_to_remove.append(pixel)
             else:
                 self.active_pixels[pixel]['brightness'] = brightness  # Update brightness
-
+        
         # Remove pixels that have faded out
         for pixel in pixels_to_remove:
             del self.active_pixels[pixel]
-
+        
         # Display the updated strip
         self.led_strip.show()
-
-        # Optional: Add a small delay to control the speed
-        time.sleep(0.001)
-
+        
+        # Adjust time delay for animation speed
+        time.sleep(0.005)  # Adjust as needed
+    
+    def get_color_for_pixel(self, pixel_position):
+        for zone in self.position_zones:
+            if zone['start_pixel'] <= pixel_position <= zone['end_pixel']:
+                return zone['color']
+        # If no zone matches, return a default color (should not occur)
+        return (255, 255, 255)  # White
+    
     def clear(self):
         self.led_strip.fill((0, 0, 0))
         self.led_strip.show()
@@ -184,6 +162,8 @@ class AudioProcessor:
         self.high_score = 0
         self.session_high_score = 0
         self.last_high_score_time = time.time()
+        self.maximum_loudness = 0
+
 
     def apply_logarithmic_scaling(self, input_value, max_value, scaling_factor):
         # Ensure input_value is at least 1 to avoid math domain error
@@ -197,16 +177,18 @@ class AudioProcessor:
     def process_audio(self):
         data = self.stream_in.read(BUFFER_SIZE, exception_on_overflow=False)
         audio_data = np.frombuffer(data, dtype=np.int16)
-
+        
         # Calculate RMS (Root Mean Square) to get a better measure of loudness
-        mean = np.mean(np.abs(audio_data))
+        rms_value = np.sqrt(np.mean(audio_data.astype(np.float32) ** 2))
 
         # Apply noise threshold
-        if mean < NOISE_THRESHOLD:
-            mean = 0.0
-
+        if rms_value < NOISE_THRESHOLD:
+            rms_value = 0.0
+        if rms_value > self.maximum_loudness:
+            self.maximum_loudness = rms_value
+            print(f"max loudness: {self.maximum_loudness}")
         # Apply logarithmic scaling
-        mapped_value = self.apply_logarithmic_scaling(mean, NUM_LEDS, SCALING_FACTOR)
+        mapped_value = self.apply_logarithmic_scaling(rms_value, NUM_LEDS, SCALING_FACTOR)
 
         # Exponential smoothing
         self.smoothed_value = (ALPHA * mapped_value) + ((1 - ALPHA) * self.smoothed_value)
@@ -245,17 +227,16 @@ class AudioPlayer:
         self.file_path = file_path
         self.audio_data, self.sample_rate = sf.read(self.file_path, dtype='float32')
         self.current_frame = 0
-        self.stream_out = None
-
-    def play(self):
         self.stream_out = pyaudio_instance.open(
             format=pyaudio.paFloat32,
             channels=self.audio_data.shape[1] if len(self.audio_data.shape) > 1 else 1,
-            rate=self.sample_rate,
+            rate=SAMPLE_RATE,
             output=True,
-            output_device_index=3,
+            output_device_index=1,
             stream_callback=self.callback,
         )
+
+    def play(self):
         self.stream_out.start_stream()
 
         while self.stream_out.is_active():
