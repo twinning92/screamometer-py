@@ -8,6 +8,12 @@ import soundfile as sf
 import threading
 import digitalio
 
+"""
+Sigmoid function for Desmos:
+\frac{144}{1+e^{\left(-k\cdot\left(x-x_0\right)\right)}}+2
+https://www.desmos.com/calculator/mbc3hiq7e7
+
+"""
 # Constants for NeoPixel
 LED_PIN = board.D12
 NUM_LEDS = 144
@@ -16,12 +22,14 @@ BRIGHTNESS = 1.0  # Scale 0-1
 # PyAudio constants
 SAMPLE_RATE = 44100
 CHANNELS = 2  # Use mono input to simplify processing
-BUFFER_SIZE = 1024  # Size of buffer for PyAudio
+BUFFER_SIZE = 512  # Size of buffer for PyAudio
 
 # Audio processing constants
-NOISE_THRESHOLD = 2000.0  # Noise floor to filter out background noise
-SCALING_FACTOR = 10.0  # Logarithmic scaling factor
-ALPHA = 0.1  # Smoothing factor (increased for better smoothing)
+NOISE_THRESHOLD = 5000.0 # Noise floor to filter out background noise
+ALPHA = 0.3  # Smoothing factor (increased for better smoothing)
+
+SIGMOID_K = 0.00033  # Adjust for "shape clamping" centered around x0, which is essentially just max (int32)/2
+SIGMOID_X0 = 18500  # default is set at max int32 / 2, but can adjust to
 
 # High score tracking
 INACTIVITY_PERIOD = 10  # Seconds to reset session high score
@@ -69,7 +77,7 @@ class LEDController:
 
     def update_leds(self, display_value, high_score, session_high_score):
         target_pixel = int(display_value)
-        
+
         # Determine direction to move
         if target_pixel > self.current_pixel:
             self.trail_direction = 1
@@ -77,10 +85,10 @@ class LEDController:
             self.trail_direction = -1
         else:
             self.trail_direction = 0
-        
+
         # Keep track of the previous position
         self.previous_pixel = self.current_pixel
-        
+
         # Move current_pixel towards target_pixel
         if self.trail_direction != 0:
             self.current_pixel += self.trail_direction * self.movement_speed
@@ -99,10 +107,10 @@ class LEDController:
             # If there's no movement, ensure the current pixel is added
             pixel_color = self.get_color_for_pixel(self.current_pixel)  # Get color based on pixel position
             self.active_pixels[self.current_pixel] = {'brightness': self.max_brightness, 'color': pixel_color}
-        
+
         # Clear all LEDs
         self.led_strip.fill((0, 0, 0))
-        
+
         # Update and display active pixels
         pixels_to_remove = []
         for pixel in list(self.active_pixels.keys()):
@@ -123,28 +131,28 @@ class LEDController:
                 pixels_to_remove.append(pixel)
             else:
                 self.active_pixels[pixel]['brightness'] = brightness  # Update brightness
-        
+
         # Remove pixels that have faded out
         for pixel in pixels_to_remove:
             del self.active_pixels[pixel]
-        
+
         # Display the updated strip
         self.led_strip.show()
-        
+
         # Adjust time delay for animation speed
         time.sleep(0.005)  # Adjust as needed
-    
+
     def get_color_for_pixel(self, pixel_position):
         for zone in self.position_zones:
             if zone['start_pixel'] <= pixel_position <= zone['end_pixel']:
                 return zone['color']
         # If no zone matches, return a default color (should not occur)
         return (255, 255, 255)  # White
-    
+
     def clear(self):
         self.led_strip.fill((0, 0, 0))
         self.led_strip.show()
-        
+
     def __exit__(self):
         self.clear()
 
@@ -158,26 +166,23 @@ class AudioProcessor:
             input_device_index=1,
             frames_per_buffer=BUFFER_SIZE,
         )
-        self.smoothed_value = 0.3
+        self.smoothed_value = 0.1
         self.high_score = 0
         self.session_high_score = 0
         self.last_high_score_time = time.time()
         self.maximum_loudness = 0
 
-
-    def apply_logarithmic_scaling(self, input_value, max_value, scaling_factor):
-        # Ensure input_value is at least 1 to avoid math domain error
-        input_value = max(input_value, 1.0)
-        # Calculate the logarithm of the input value
-        log_value = math.log(input_value) / math.log(scaling_factor)
-        # Scale the logarithmic value to the max_value range
-        scaled_value = (log_value / (math.log(32767) / math.log(scaling_factor))) * max_value
-        return min(max_value, scaled_value)
+    def sigmoid_mapping(self, input_value, max_value=144):
+        if input_value < 1:
+            sigmoid = 1
+        else:
+            sigmoid = max_value / (1 + math.exp(-SIGMOID_K * (input_value - SIGMOID_X0)))
+        return sigmoid
 
     def process_audio(self):
         data = self.stream_in.read(BUFFER_SIZE, exception_on_overflow=False)
         audio_data = np.frombuffer(data, dtype=np.int16)
-        
+
         # Calculate RMS (Root Mean Square) to get a better measure of loudness
         rms_value = np.sqrt(np.mean(audio_data.astype(np.float32) ** 2))
 
@@ -186,16 +191,19 @@ class AudioProcessor:
             rms_value = 0.0
         if rms_value > self.maximum_loudness:
             self.maximum_loudness = rms_value
-            print(f"max loudness: {self.maximum_loudness}")
-        # Apply logarithmic scaling
-        mapped_value = self.apply_logarithmic_scaling(rms_value, NUM_LEDS, SCALING_FACTOR)
+            print(f"max loudness (rms): {self.maximum_loudness}")
 
+        mapped_value = self.sigmoid_mapping(rms_value, NUM_LEDS)
+        print(f"{mapped_value=}")
         # Exponential smoothing
         self.smoothed_value = (ALPHA * mapped_value) + ((1 - ALPHA) * self.smoothed_value)
         display_value = int(self.smoothed_value)
-
+        if rms_value > 0.0:
+            print(f"rms_value={rms_value:.2f}\thigh_score={self.maximum_loudness:.2f}\t \
+                sigmoid_value={mapped_value:.2f}\tsmoothed_value={self.smoothed_value:.2f}\tdisplay_value={display_value}")
         # Update high scores
         current_time = time.time()
+        # print(display_value)
         if display_value > self.high_score:
             self.high_score = display_value
 
@@ -273,7 +281,7 @@ def motion_sense():
     motion_sensor = MotionSensor()
     while True:
         if motion_sensor.detect_motion():
-            print("Motion Detected")
+    #        print("Motion Detected")
             audio_player = AudioPlayer("../test_recording.wav")
             audio_player.play()
             time.sleep(5)  # Debounce time
@@ -285,7 +293,7 @@ def main():
 
     motion_thread.start()
     scream_thread.start()
-    
+
     try:
         while True:
             time.sleep(0.1)
